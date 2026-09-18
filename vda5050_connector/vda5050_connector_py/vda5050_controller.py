@@ -1930,9 +1930,13 @@ class VDA5050Controller(Node):
         self._current_node_goal = None
 
         # If there are still released edges (e.g. from a stitch), dispatch
-        # new navigation.
+        # new navigation. A pending SOFT/HARD action on the reached node keeps
+        # the robot stopped (6.2.2); navigation is then resumed by
+        # _on_active_order once no blocking action is left.
         released_edges, _ = self._get_drivable_segment()
-        if len(released_edges) > 0:
+        if len(released_edges) > 0 and not self._check_hard_soft_actions(
+            self._current_node_actions
+        ):
             self._process_next_navigation()
 
     def _navigate_through_nodes_feedback_callback(self, feedback_msg):
