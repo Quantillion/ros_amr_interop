@@ -1502,7 +1502,10 @@ class VDA5050Controller(Node):
 
         if len(self._current_node_actions) > 0:
             self._execute_node_actions()
-            return
+            # Only SOFT/HARD actions keep the robot stopped (6.2.2); driving may
+            # resume alongside the remaining NONE actions.
+            if self._check_hard_soft_actions(self._current_node_actions):
+                return
 
         if not self._is_navigation_active():
             self._process_next_navigation()
