@@ -495,6 +495,20 @@ def get_stitch_orders(order_id=str(uuid4())):
     return [base_order, stitch_order]
 
 
+def make_order(order_id, order_update_id, nodes, edges):
+    return Order(
+        header_id=0,
+        timestamp=get_vda5050_ts(),
+        version="1.1.1",
+        manufacturer="MANUFACTURER",
+        serial_number="SERIAL_NUMBER",
+        order_id=order_id,
+        order_update_id=order_update_id,
+        nodes=nodes,
+        edges=edges,
+    )
+
+
 def test_vda5050_controller_node_new_order(
     mocker,
     adapter_node,
@@ -1415,6 +1429,105 @@ def test_vda5050_controller_skipped_feedback_nodes(
     assert node._current_state.last_node_sequence_id == 8
     assert len(node._current_state.node_states) == 0
     assert len(node._current_state.edge_states) == 0
+
+
+def test_feedback_does_not_target_node_beyond_goal(
+    adapter_node,
+    action_server_nav_through_nodes,
+    action_server_process_vda_action,
+    service_get_state,
+    service_supported_actions,
+):
+    """Test that a released node beyond the goal's end is not taken as the navigation target.
+
+    When a goal stops on a SOFT/HARD node, the nodes after it may already be released
+    but are not part of the goal. Keeping the navigation target within the goal prevents
+    the controller from believing it already drives to these nodes, which would leave the
+    robot idle once the blocking action finishes.
+    """
+    nav_through_nodes_param = Parameter(
+        "enable_nav_through_nodes", type_=Parameter.Type.BOOL, value=True)
+    node = VDA5050Controller(parameter_overrides=[nav_through_nodes_param])
+
+    # Builds the graph A → B (HARD) → C used by the order below.
+    hard_action = Action(action_type="pick", action_id="pick_B", blocking_type=Action.HARD)
+    a = Node(node_id="A", sequence_id=0, released=True)
+    b = Node(node_id="B", sequence_id=2, released=True, actions=[hard_action])
+    c = Node(node_id="C", sequence_id=4, released=True)
+    e1 = Edge(edge_id="e1", sequence_id=1, released=True, start_node_id="A", end_node_id="B")
+    e2 = Edge(edge_id="e2", sequence_id=3, released=True, start_node_id="B", end_node_id="C")
+
+    # Sends a goal A → B that stops on B (HARD) while C is already released.
+    node.process_order(make_order(str(uuid4()), 0, [a, b, c], [e1, e2]))
+    node._on_active_order()
+    assert node._nav_through_nodes_last_seq == 2
+
+    # Does not take C as the navigation target on arrival at B.
+    feedback_msg = NavigateThroughNodes.Impl.FeedbackMessage()
+    feedback_msg.feedback.last_node = b
+    node._navigate_through_nodes_feedback_callback(feedback_msg)
+    assert node._current_state.last_node_id == "B"
+    assert node._current_node_goal is None
+
+
+def test_extension_restores_target_cleared_by_earlier_feedback(
+    mocker,
+    adapter_node,
+    action_server_nav_through_nodes,
+    action_server_process_vda_action,
+    service_get_state,
+    service_supported_actions,
+):
+    """Test that a confirmed extension restores the navigation target.
+
+    When the robot reaches the goal's end before the extension response arrives, feedback
+    clears the target since the next node is not yet part of the goal. Restoring it keeps
+    node arrivals on the extended segment reported.
+    """
+    nav_through_nodes_param = Parameter(
+        "enable_nav_through_nodes", type_=Parameter.Type.BOOL, value=True)
+    node = VDA5050Controller(parameter_overrides=[nav_through_nodes_param])
+
+    # Mocks the ExtendNavigation client with a response the test delivers later.
+    from vda5050_connector.srv import ExtendNavigation
+    extend_future = Future()
+    node._extend_nav_svc_cli = mocker.MagicMock()
+    node._extend_nav_svc_cli.call_async = mocker.MagicMock(return_value=extend_future)
+
+    # Builds the graph A → B → C → D used by the orders below.
+    a = Node(node_id="A", sequence_id=0, released=True)
+    b = Node(node_id="B", sequence_id=2, released=True)
+    c = Node(node_id="C", sequence_id=4, released=True)
+    d = Node(node_id="D", sequence_id=6, released=True)
+    e1 = Edge(edge_id="e1", sequence_id=1, released=True, start_node_id="A", end_node_id="B")
+    e2 = Edge(edge_id="e2", sequence_id=3, released=True, start_node_id="B", end_node_id="C")
+    e3 = Edge(edge_id="e3", sequence_id=5, released=True, start_node_id="C", end_node_id="D")
+    order_id = str(uuid4())
+
+    # Sends a goal A → B, with C still in the horizon.
+    c_horizon = Node(node_id="C", sequence_id=4, released=False)
+    e2_horizon = Edge(
+        edge_id="e2", sequence_id=3, released=False, start_node_id="B", end_node_id="C")
+    node.process_order(make_order(order_id, 0, [a, b, c_horizon], [e1, e2_horizon]))
+    rclpy.spin_once(node)
+    rclpy.spin_once(adapter_node)
+    assert node._nav_through_nodes_last_seq == 2
+
+    # Requests an extension up to D when the stitch releases C and D.
+    node.process_order(make_order(order_id, 1, [b, c, d], [e2, e3]))
+    node._extend_nav_svc_cli.call_async.assert_called_once()
+
+    # Clears the target on arrival at B: C is not part of the goal until the extension
+    # is confirmed.
+    feedback_msg = NavigateThroughNodes.Impl.FeedbackMessage()
+    feedback_msg.feedback.last_node = b
+    node._navigate_through_nodes_feedback_callback(feedback_msg)
+    assert node._current_node_goal is None
+
+    # Restores C as the target once the extension is confirmed.
+    extend_future.set_result(ExtendNavigation.Response(success=True, message="ok"))
+    assert node._nav_through_nodes_last_seq == 6
+    assert node._current_node_goal == c
 
 
 def test_stitch_preserves_action_statuses(

@@ -1967,11 +1967,12 @@ class VDA5050Controller(Node):
                 self._process_last_edge_node()
 
             _, released_nodes = self._get_drivable_segment()
-            if len(released_nodes) == 0:
-                # No more drivable pairs — order finished or only instant
-                # actions remain.
+            # Released nodes beyond the current goal's end are not being driven to yet; they become
+            # the target once an extension is confirmed or a new goal is dispatched.
+            if (not released_nodes
+                    or released_nodes[0].sequence_id > self._nav_through_nodes_last_seq):
+                self._current_node_goal = None
                 return
-
             self._current_node_goal = released_nodes[0]
 
     def _is_navigation_active(self) -> bool:
@@ -1995,6 +1996,12 @@ class VDA5050Controller(Node):
             self._nav_through_nodes_last_seq = last_seq
             self.logger.info(
                 f"Navigation extended in-flight up to seq {last_seq}")
+            # Restores the navigation target when the robot reached the old goal end before this
+            # response: feedback then cleared it, and without a target node arrivals are ignored.
+            if self._current_node_goal is None and self._is_navigation_active():
+                _, released_nodes = self._get_drivable_segment()
+                if released_nodes and released_nodes[0].sequence_id <= last_seq:
+                    self._current_node_goal = released_nodes[0]
         else:
             self.logger.warn(
                 f"Could not extend navigation: {result.message}. "
