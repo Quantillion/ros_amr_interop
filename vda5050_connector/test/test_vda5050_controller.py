@@ -1431,6 +1431,63 @@ def test_vda5050_controller_skipped_feedback_nodes(
     assert len(node._current_state.edge_states) == 0
 
 
+def test_stitch_while_navigating_stops_on_blocking_node(
+    mocker,
+    adapter_node,
+    action_server_nav_through_nodes,
+    action_server_process_vda_action,
+    service_get_state,
+    service_supported_actions,
+):
+    """Test that an in-flight goal is not extended past a SOFT/HARD node."""
+    nav_through_nodes_param = Parameter(
+        "enable_nav_through_nodes", type_=Parameter.Type.BOOL, value=True)
+    node = VDA5050Controller(parameter_overrides=[nav_through_nodes_param])
+
+    # Mocks the ExtendNavigation client to capture its requests and answer them immediately.
+    from vda5050_connector.srv import ExtendNavigation
+    mock_extend_future = Future()
+    mock_extend_future.set_result(ExtendNavigation.Response(success=True, message="ok"))
+    node._extend_nav_svc_cli = mocker.MagicMock()
+    node._extend_nav_svc_cli.service_is_ready = mocker.MagicMock(return_value=True)
+    node._extend_nav_svc_cli.call_async = mocker.MagicMock(return_value=mock_extend_future)
+
+    # Builds the graph A → B → C (HARD) → D → E used by the orders below.
+    hard_action = Action(action_type="pick", action_id="pick_C", blocking_type=Action.HARD)
+    a = Node(node_id="A", sequence_id=0, released=True)
+    b = Node(node_id="B", sequence_id=2, released=True)
+    c = Node(node_id="C", sequence_id=4, released=True, actions=[hard_action])
+    d = Node(node_id="D", sequence_id=6, released=True)
+    e = Node(node_id="E", sequence_id=8, released=True)
+    e1 = Edge(edge_id="e1", sequence_id=1, released=True, start_node_id="A", end_node_id="B")
+    e2 = Edge(edge_id="e2", sequence_id=3, released=True, start_node_id="B", end_node_id="C")
+    e3 = Edge(edge_id="e3", sequence_id=5, released=True, start_node_id="C", end_node_id="D")
+    e4 = Edge(edge_id="e4", sequence_id=7, released=True, start_node_id="D", end_node_id="E")
+    order_id = str(uuid4())
+
+    # Sends a goal A → B, with C (HARD) still in the horizon.
+    c_horizon = Node(node_id="C", sequence_id=4, released=False, actions=[hard_action])
+    e2_horizon = Edge(
+        edge_id="e2", sequence_id=3, released=False, start_node_id="B", end_node_id="C")
+    node.process_order(make_order(order_id, 0, [a, b, c_horizon], [e1, e2_horizon]))
+    rclpy.spin_once(node)
+    rclpy.spin_once(adapter_node)
+    assert node._nav_through_nodes_last_seq == 2
+
+    # Extends the goal up to C only when the stitch releases C (HARD) and D.
+    node.process_order(make_order(order_id, 1, [b, c, d], [e2, e3]))
+    req = node._extend_nav_svc_cli.call_async.call_args[0][0]
+    assert [n.node_id for n in req.nodes] == ["B", "C"]
+    assert [e.edge_id for e in req.edges] == ["e2"]
+    assert node._nav_through_nodes_last_seq == 4
+
+    # Keeps the goal ending at C (HARD), even once the stitch releases E.
+    node._extend_nav_svc_cli.call_async.reset_mock()
+    node.process_order(make_order(order_id, 2, [d, e], [e4]))
+    node._extend_nav_svc_cli.call_async.assert_not_called()
+    assert node._nav_through_nodes_last_seq == 4
+
+
 def test_feedback_does_not_target_node_beyond_goal(
     adapter_node,
     action_server_nav_through_nodes,
