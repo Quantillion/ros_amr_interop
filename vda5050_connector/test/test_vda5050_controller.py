@@ -58,13 +58,22 @@ def succeeded_result(action_type):
     return action_type.Impl.GetResultService.Response(status=GoalStatus.STATUS_SUCCEEDED)
 
 
-def get_order_new(order_id=str(uuid4()), order_update_id=0):
+def make_order(order_id, order_update_id, nodes, edges):
     return Order(
         header_id=0,
         timestamp=get_vda5050_ts(),
         version="1.1.1",
         manufacturer="MANUFACTURER",
         serial_number="SERIAL_NUMBER",
+        order_id=order_id,
+        order_update_id=order_update_id,
+        nodes=nodes,
+        edges=edges,
+    )
+
+
+def get_order_new(order_id=str(uuid4()), order_update_id=0):
+    return make_order(
         order_id=order_id,
         order_update_id=order_update_id,
         nodes=[
@@ -180,12 +189,7 @@ def get_order_new(order_id=str(uuid4()), order_update_id=0):
 
 
 def get_order_update(order_id=str(uuid4()), order_update_id=0):
-    return Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    return make_order(
         order_id=order_id,
         order_update_id=order_update_id,
         nodes=[
@@ -232,12 +236,7 @@ def get_order_update(order_id=str(uuid4()), order_update_id=0):
 
 
 def get_order_w_unreleased_new(order_id=str(uuid4()), order_update_id=0):
-    return Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    return make_order(
         order_id=order_id,
         order_update_id=order_update_id,
         nodes=[
@@ -380,12 +379,7 @@ def get_stitch_orders(order_id=str(uuid4())):
             ActionParameter(key="abc", value="xyz")
         ]
     )
-    base_order = Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    base_order = make_order(
         order_id=order_id,
         order_update_id=0,
         nodes=[
@@ -436,12 +430,7 @@ def get_stitch_orders(order_id=str(uuid4())):
         ],
     )
 
-    stitch_order = Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    stitch_order = make_order(
         order_id=order_id,
         order_update_id=1,
         nodes=[
@@ -493,20 +482,6 @@ def get_stitch_orders(order_id=str(uuid4())):
     )
 
     return [base_order, stitch_order]
-
-
-def make_order(order_id, order_update_id, nodes, edges):
-    return Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
-        order_id=order_id,
-        order_update_id=order_update_id,
-        nodes=nodes,
-        edges=edges,
-    )
 
 
 def test_vda5050_controller_node_new_order(
@@ -1184,12 +1159,7 @@ def test_vda5050_controller_stitch_while_navigating(
 
     # --- Build a base order with 3 released nodes + 1 unreleased horizon node ---
     order_id = str(uuid4())
-    base_order = Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    base_order = make_order(
         order_id=order_id,
         order_update_id=0,
         nodes=[
@@ -1245,12 +1215,7 @@ def test_vda5050_controller_stitch_while_navigating(
     spy_accept_order.reset_mock()
     spy_send_adapter_navigate_through_nodes.reset_mock()
 
-    stitch_order = Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    stitch_order = make_order(
         order_id=order_id,
         order_update_id=1,
         nodes=[
@@ -1338,12 +1303,7 @@ def test_vda5050_controller_skipped_feedback_nodes(
 
     # --- Order: A(0) → B(2) → C(4) → D(6) → E(8) ---
     order_id = str(uuid4())
-    order = Order(
-        header_id=0,
-        timestamp=get_vda5050_ts(),
-        version="1.1.1",
-        manufacturer="MANUFACTURER",
-        serial_number="SERIAL_NUMBER",
+    order = make_order(
         order_id=order_id,
         order_update_id=0,
         nodes=[
@@ -1667,10 +1627,9 @@ def test_stitch_no_actions_on_stitch_node(
 
     # Base order: A(0) --[e1 w/ edge_action]--> B(2) --[e2 unreleased]--> C(4 unreleased)
     # The horizon keeps has_current_order() True after reaching B.
-    base_order = Order(
-        header_id=0, timestamp=get_vda5050_ts(), version="1.1.1",
-        manufacturer="MANUFACTURER", serial_number="SERIAL_NUMBER",
-        order_id=order_id, order_update_id=0,
+    base_order = make_order(
+        order_id=order_id,
+        order_update_id=0,
         nodes=[
             Node(node_id="A", sequence_id=0, released=True,
                  node_position=NodePosition(x=0.0, y=0.0, theta=0.0, map_id="map")),
@@ -1689,10 +1648,9 @@ def test_stitch_no_actions_on_stitch_node(
     )
 
     # Stitch order: B(2, no actions) --> C(4, node_c_action)
-    stitch_order = Order(
-        header_id=0, timestamp=get_vda5050_ts(), version="1.1.1",
-        manufacturer="MANUFACTURER", serial_number="SERIAL_NUMBER",
-        order_id=order_id, order_update_id=1,
+    stitch_order = make_order(
+        order_id=order_id,
+        order_update_id=1,
         nodes=[
             Node(node_id="B", sequence_id=2, released=True,
                  node_position=NodePosition(x=1.0, y=0.0, theta=0.0, map_id="map")),
@@ -1733,10 +1691,9 @@ def test_stitch_no_actions_on_stitch_node(
 
 def get_order_with_node_b_action(blocking_type):
     """A(0) --e1--> B(2, one action of ``blocking_type``) --e2--> C(4), all released."""
-    return Order(
-        header_id=0, timestamp=get_vda5050_ts(), version="1.1.1",
-        manufacturer="MANUFACTURER", serial_number="SERIAL_NUMBER",
-        order_id=str(uuid4()), order_update_id=0,
+    return make_order(
+        order_id=str(uuid4()),
+        order_update_id=0,
         nodes=[
             Node(node_id="A", sequence_id=0, released=True,
                  node_position=NodePosition(x=0.0, y=0.0, theta=0.0, map_id="map")),
