@@ -1499,6 +1499,9 @@ class VDA5050Controller(Node):
             }
         )
         self._update_action_status(self._cancel_action.action_id, VDACurrentAction.FINISHED)
+        # Publish now: a NEW order arriving before the next periodic publish clears action_states,
+        # and the master control would never see the cancelOrder finish.
+        self._publish_state()
         self._current_order = VDAOrder(order_id="-1")
         self._cancel_action = None
         self._current_node_goal = None
