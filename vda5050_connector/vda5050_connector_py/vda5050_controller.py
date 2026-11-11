@@ -125,7 +125,7 @@ class ActionErrors(Enum):
 class OrderRejectErrors(Enum):
     """Order Processing - Reject Error types."""
 
-    VALIDATION_ERROR = "validationOrder"
+    VALIDATION_ERROR = "validationError"  # the VDA 5050 error type (was "validationOrder")
     ORDER_UPDATE_ERROR = "orderUpdateError"
     NO_ROUTE_ERROR = "noRouteError"
 
@@ -242,6 +242,9 @@ class VDA5050Controller(Node):
             self, "execute_order_period", DEFAULT_EXECUTE_ORDER_PERIOD
         )
         self._interface_name = read_str_parameter(self, "interface_name", DEFAULT_INTERFACE_NAME)
+        # VDA 5050 2.1 6.7.1: maps the vehicle has. Empty = do not check orders' mapIds.
+        # [""], not []: rclpy types an empty default as BYTE_ARRAY and then refuses a string list.
+        self._known_map_ids = [m for m in read_str_array_parameter(self, "known_map_ids", [""]) if m]
 
 
     # ---- Configure ROS interfaces ----
@@ -921,7 +924,12 @@ class VDA5050Controller(Node):
         # Validate order msg
         msg_is_valid, error = self.order_msg_is_valid(order)
         if not msg_is_valid:
-            self._reject_order(order, OrderRejectErrors.VALIDATION_ERROR, error.error_description)
+            self._reject_order(
+                order,
+                OrderRejectErrors.VALIDATION_ERROR,
+                error.error_description,
+                list(error.error_references),
+            )
             return
 
         accept_mode = None
@@ -992,7 +1000,23 @@ class VDA5050Controller(Node):
             True if msg is valid, False otherwise, VDAError if msg in invalid.
 
         """
-        # TODO: Proper implementation
+        # Only the map check (6.7.1) is implemented; disabled when known_map_ids is empty.
+        if self._known_map_ids:
+            for node in order.nodes:
+                map_id = node.node_position.map_id
+                if map_id and map_id not in self._known_map_ids:
+                    return False, VDAError(
+                        error_type=OrderRejectErrors.VALIDATION_ERROR.value,
+                        error_description=(
+                            f"order {order.order_id}: unknown map '{map_id}'"
+                            f" (node '{node.node_id}')"
+                        ),
+                        error_level=VDAError.WARNING,
+                        error_references=[
+                            VDAErrorReference(reference_key="node_id", reference_value=node.node_id),
+                            VDAErrorReference(reference_key="map_id", reference_value=map_id),
+                        ],
+                    )
         return True, VDAError()
 
     def _has_current_order(self) -> bool:
@@ -1155,7 +1179,6 @@ class VDA5050Controller(Node):
         has_same_node_position = (
             last_node_position.x == stitch_node_position.x
             and last_node_position.y == stitch_node_position.y
-            and last_node_position.y == stitch_node_position.y
             and last_node_position.theta == stitch_node_position.theta
             and (last_node_position.allowed_deviation_x_y ==
                  stitch_node_position.allowed_deviation_x_y)
@@ -1286,44 +1309,66 @@ class VDA5050Controller(Node):
             self._process_node(self._current_order.nodes[0])
         elif self._enable_nav_through_nodes and self._is_navigation_active():
             # Extend the in-flight navigation goal with the newly released
-            # segment from the stitch order. Filter out nodes/edges whose
-            # sequence_id is already covered by the current goal (up to
-            # _nav_through_nodes_last_seq) and any that are unreleased.
-            # nodes[0] is the stitch reference node (shared with the old
-            # base), so new targets start at nodes[1:].
-            new_edges = [
-                e for e in order.edges
-                if e.released and e.sequence_id > self._nav_through_nodes_last_seq
-            ]
-            new_nodes = [
-                n for n in order.nodes[1:]
-                if n.released and n.sequence_id > self._nav_through_nodes_last_seq
-            ]
+            # segment beyond the goal's end node, following the same rules as
+            # _get_drivable_segment so the robot still stops on SOFT/HARD
+            # actions (§6.2.2).
+            goal_end_seq = self._nav_through_nodes_last_seq
+            goal_end_node = next(
+                (n for n in self._current_order.nodes if n.sequence_id == goal_end_seq), None
+            )
+            goal_end_edge = next(
+                (e for e in self._current_order.edges if e.sequence_id == goal_end_seq - 1), None
+            )
+            if goal_end_node is None:
+                self.logger.warn(
+                    f"Stitch while navigating: goal end node seq {goal_end_seq} not found"
+                    " in order, not extending.")
+                return
+            if (self._check_hard_soft_actions(goal_end_node.actions)
+                    or (goal_end_edge is not None
+                        and self._check_hard_soft_actions(goal_end_edge.actions))):
+                self.logger.info(
+                    f"Stitch while navigating: goal ends on blocking node seq {goal_end_seq},"
+                    " not extending.")
+                return
+
+            new_edges, new_nodes = self._get_drivable_segment(after_seq=goal_end_seq)
 
             self.logger.info(
                 f"Stitch while navigating: {len(new_edges)} new edges,"
-                f" {len(new_nodes)} new nodes beyond seq"
-                f" {self._nav_through_nodes_last_seq}")
+                f" {len(new_nodes)} new nodes beyond seq {goal_end_seq}")
 
             if new_edges and new_nodes:
                 # Build the ExtendNavigation request.  req.nodes[0] is the
-                # stitch node — the last node the handler already knows about.
-                # The handler uses it to verify that the extension connects to
-                # its current path endpoint before appending req.nodes[1:]
-                # and req.edges.
-                req = ExtendNavigation.Request()
-                req.edges = new_edges
-                req.nodes = [order.nodes[0]] + new_nodes
-                future = self._extend_nav_svc_cli.call_async(req)
-                future.add_done_callback(
-                    functools.partial(
-                        self._extend_navigation_response_callback,
-                        new_nodes[-1].sequence_id
+                # goal's end node — the last node the handler already knows
+                # about. The handler uses it to verify that the extension
+                # connects to its current path endpoint before appending
+                # req.nodes[1:] and req.edges.
+                if self._extend_nav_svc_cli.service_is_ready():
+                    req = ExtendNavigation.Request()
+                    req.edges = new_edges
+                    req.nodes = [goal_end_node] + new_nodes
+                    future = self._extend_nav_svc_cli.call_async(req)
+                    future.add_done_callback(
+                        functools.partial(
+                            self._extend_navigation_response_callback,
+                            new_nodes[-1].sequence_id
+                        )
                     )
-                )
+                else:
+                    self.logger.warn(
+                        "ExtendNavigation service unavailable; keeping in-flight goal "
+                        "unchanged and falling back to post-goal dispatch."
+                    )
 
 
-    def _reject_order(self, order: VDAOrder, error: OrderRejectErrors, description: str = ""):
+    def _reject_order(
+        self,
+        order: VDAOrder,
+        error: OrderRejectErrors,
+        description: str = "",
+        references: list = None,
+    ):
         """
         Reject order.
 
@@ -1335,9 +1380,10 @@ class VDA5050Controller(Node):
                 ORDER_UPDATE_ERROR
                 NO_ROUTE_ERROR
             description (str): Order rejection description
+            references (list): Extra VDAErrorReference entries
 
         """
-        error_references = []
+        error_references = list(references or [])
         if error == OrderRejectErrors.ORDER_UPDATE_ERROR:
             # On orderUpdateError send orderUpdateId and orderId as reference
 
@@ -1424,7 +1470,13 @@ class VDA5050Controller(Node):
         # Interrupt any running navigation goal
         if self._is_navigation_active():
             if self._enable_nav_through_nodes:
-                self._navigate_through_nodes_goal_handle.cancel_goal_async()
+                if self._navigate_through_nodes_goal_handle is not None:
+                    self._navigate_through_nodes_goal_handle.cancel_goal_async()
+                else:
+                    self.logger.info(
+                        "cancelOrder requested while nav-through-nodes goal is pending acceptance;"
+                        " cancel will be sent once accepted."
+                    )
             else:
                 self._navigate_to_node_goal_handle.cancel_goal_async()
             return
@@ -1483,15 +1535,18 @@ class VDA5050Controller(Node):
         if not self._has_current_order():
             return
 
-        # Do not retry navigation while any error is active — controller
-        # errors (e.g. navigation failure) require a cancelOrder to clear;
-        # adapter errors self-resolve when the adapter stops reporting them.
-        if len(self._current_state.errors) > 0:
+        # Do not retry navigation while any FATAL error is active.
+        # WARNING-level errors (e.g. rejected order updates) must not
+        # freeze an otherwise valid in-flight order.
+        if any(error.error_level == VDAError.FATAL for error in self._current_state.errors):
             return
 
         if len(self._current_node_actions) > 0:
             self._execute_node_actions()
-            return
+            # Only SOFT/HARD actions keep the robot stopped (6.2.2); driving may
+            # resume alongside the remaining NONE actions.
+            if self._check_hard_soft_actions(self._current_node_actions):
+                return
 
         if not self._is_navigation_active():
             self._process_next_navigation()
@@ -1587,7 +1642,7 @@ class VDA5050Controller(Node):
                 break
         return hard_soft_action_found
 
-    def _get_drivable_segment(self):
+    def _get_drivable_segment(self, after_seq=None):
         """
         Return the contiguous released edge-node pairs for one navigation goal.
 
@@ -1607,6 +1662,12 @@ class VDA5050Controller(Node):
         If the very next edge is not released the ``new_base_request`` flag
         is set so that fleet control can extend the base (§6.6.3).
 
+        Args:
+        ----
+            after_seq (int): Node sequence_id the segment starts from.
+                Defaults to the last reached node; when given, the
+                ``new_base_request`` flag is left untouched.
+
         Returns
         -------
         tuple[list[VDAEdge], list[VDANode]]
@@ -1614,6 +1675,10 @@ class VDA5050Controller(Node):
             ``edges[i]`` leads to ``nodes[i]``.
 
         """
+        request_base = after_seq is None
+        if after_seq is None:
+            after_seq = self._current_state.last_node_sequence_id
+
         released_edges = []
         released_nodes = []
 
@@ -1623,11 +1688,11 @@ class VDA5050Controller(Node):
         }
 
         for edge in self._current_order.edges:
-            if edge.sequence_id < self._current_state.last_node_sequence_id + 1:
+            if edge.sequence_id < after_seq + 1:
                 continue
 
             if not edge.released:
-                if len(released_edges) == 0:
+                if request_base and len(released_edges) == 0:
                     # Next edge is part of the horizon — request a base
                     # extension (§6.6.3).
                     if not self._current_state.new_base_request:
@@ -1866,6 +1931,13 @@ class VDA5050Controller(Node):
 
         self.logger.info("Navigate through nodes goal request accepted by adapter.")
 
+        if self._canceling_order():
+            self.logger.info(
+                "Cancel requested while waiting for nav-through-nodes goal acceptance; "
+                "canceling accepted goal now."
+            )
+            self._navigate_through_nodes_goal_handle.cancel_goal_async()
+
         get_result_future = self._navigate_through_nodes_goal_handle.get_result_async()
         get_result_future.add_done_callback(self._navigate_through_nodes_result_callback)
 
@@ -1912,9 +1984,13 @@ class VDA5050Controller(Node):
         self._current_node_goal = None
 
         # If there are still released edges (e.g. from a stitch), dispatch
-        # new navigation.
+        # new navigation. A pending SOFT/HARD action on the reached node keeps
+        # the robot stopped (6.2.2); navigation is then resumed by
+        # _on_active_order once no blocking action is left.
         released_edges, _ = self._get_drivable_segment()
-        if len(released_edges) > 0:
+        if len(released_edges) > 0 and not self._check_hard_soft_actions(
+            self._current_node_actions
+        ):
             self._process_next_navigation()
 
     def _navigate_through_nodes_feedback_callback(self, feedback_msg):
@@ -1942,11 +2018,12 @@ class VDA5050Controller(Node):
                 self._process_last_edge_node()
 
             _, released_nodes = self._get_drivable_segment()
-            if len(released_nodes) == 0:
-                # No more drivable pairs — order finished or only instant
-                # actions remain.
+            # Released nodes beyond the current goal's end are not being driven to yet; they become
+            # the target once an extension is confirmed or a new goal is dispatched.
+            if (not released_nodes
+                    or released_nodes[0].sequence_id > self._nav_through_nodes_last_seq):
+                self._current_node_goal = None
                 return
-
             self._current_node_goal = released_nodes[0]
 
     def _is_navigation_active(self) -> bool:
@@ -1970,6 +2047,12 @@ class VDA5050Controller(Node):
             self._nav_through_nodes_last_seq = last_seq
             self.logger.info(
                 f"Navigation extended in-flight up to seq {last_seq}")
+            # Restores the navigation target when the robot reached the old goal end before this
+            # response: feedback then cleared it, and without a target node arrivals are ignored.
+            if self._current_node_goal is None and self._is_navigation_active():
+                _, released_nodes = self._get_drivable_segment()
+                if released_nodes and released_nodes[0].sequence_id <= last_seq:
+                    self._current_node_goal = released_nodes[0]
         else:
             self.logger.warn(
                 f"Could not extend navigation: {result.message}. "

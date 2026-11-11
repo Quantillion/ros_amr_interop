@@ -133,7 +133,7 @@ def generate_vda_order_msg(order):
                     VDAControlPoint(
                         x=float(cp["x"]),
                         y=float(cp["y"]),
-                        orientation=float(cp["orientation"]),
+                        orientation=float(cp.get("orientation", 0.0)),
                         weight=float(cp.get("weight", 1)),
                     )
                     for cp in edge["trajectory"]["control_points"]
@@ -360,7 +360,7 @@ class MQTTBridge(Node):
             )
 
         else:
-            self.logger.error("Failed to connect, return code %d\n", rc)
+            self.logger.error(f"Failed to connect, return code {rc}")
 
     def on_message_mqtt(self, client, userdata, msg):
         """MQTT client message callback."""
