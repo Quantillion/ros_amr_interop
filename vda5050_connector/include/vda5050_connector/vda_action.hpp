@@ -39,6 +39,7 @@
  */
 #include <array>
 #include <initializer_list>
+#include <mutex>
 
 #include "vda5050_connector/handler.hpp"
 
@@ -96,6 +97,8 @@ public:
     const vda5050_msgs::msg::Action & action_msg,
     const std::shared_ptr<GoalHandleProcessVDAAction> goal_handle)
   {
+    // Runs on the goal thread while executor callbacks may read goal_handle_/action_state_.
+    std::lock_guard<std::recursive_mutex> lock(action_mutex_);
     action_msg_ = action_msg;
     goal_handle_ = goal_handle;
 
@@ -155,7 +158,11 @@ public:
    * @brief Get the current action_state.
    * @return STATES action_state.
    */
-  STATES get_action_state() const { return action_state_; }
+  STATES get_action_state() const
+  {
+    std::lock_guard<std::recursive_mutex> lock(action_mutex_);
+    return action_state_;
+  }
 
   /**
    * @brief Update the state of get action and publish its feedback.
@@ -163,6 +170,7 @@ public:
    */
   virtual void update_action_state(STATES action_state)
   {
+    std::lock_guard<std::recursive_mutex> lock(action_mutex_);
     action_state_ = action_state;
     current_action_msg_.action_status = action_state_str(action_state_);
     result_->result = current_action_msg_;
@@ -271,6 +279,12 @@ public:
   }
 
 protected:
+  // Guards action_state_/result_/current_action_msg_ (and any subclass state
+  // sharing the same lock) between execute()'s busy-loop thread and an
+  // asynchronous completion callback on another thread. Recursive: a callback
+  // may already hold it while calling update_action_state()/get_action_state().
+  mutable std::recursive_mutex action_mutex_;
+
   // Current action state
   STATES action_state_{STATES::WAITING};
 
